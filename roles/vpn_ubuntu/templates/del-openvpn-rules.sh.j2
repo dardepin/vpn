@@ -1,0 +1,6 @@
+#!/bin/sh
+iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE
+iptables -D INPUT -i tun0 -j ACCEPT
+iptables -D FORWARD -i {{ ansible_default_ipv4.interface }} -o tun0 -j ACCEPT
+iptables -D FORWARD -i tun0 -o {{ ansible_default_ipv4.interface }} -j ACCEPT
+iptables -D INPUT -i {{ ansible_default_ipv4.interface }} -p {{ openvpn_prot }} --dport {{ openvpn_port }}  -j ACCEPT

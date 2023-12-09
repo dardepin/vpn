@@ -1,0 +1,177 @@
+---
+# usage: ansible-playbook vpn-add-client.yml --ask-vault-pass
+
+- hosts: vpn
+  name: Add client to OpenVPN
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include login prefix & optional password
+      ansible.builtin.include_vars:
+        vpn_client.yml
+    - name: Use python3
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: /usr/bin/python3
+      when: ansible_distribution == 'CentOS' and ansible_facts['distribution_major_version'] | int == 7
+    - name: Generate random client name from prefix
+      ansible.builtin.set_fact:
+        clent_name: "{{ client_prefix }}_{{ lookup('community.general.random_string', length=16, special=false) }}"
+    - name: Print genearted client name
+      ansible.builtin.debug:
+        msg: "Generated key name:{{ clent_name }}"
+
+    - name: Easy-rsa build-client-full without password
+      ansible.builtin.command:
+        cmd: '/etc/openvpn/easy-rsa/easyrsa --batch build-client-full {{ clent_name }} nopass'
+      args:
+        chdir: '/etc/openvpn/easy-rsa/'
+      register: easy_rsa_build_client_result
+      changed_when: false
+      when: client_passwd == ''
+
+    - name: Easy-rsa build-client-full with password
+      ansible.builtin.expect:
+        command: '/etc/openvpn/easy-rsa/easyrsa --batch build-client-full {{ clent_name }}'
+        chdir: '/etc/openvpn/easy-rsa/'
+        timeout: '300'
+        responses:
+          (?i)Enter PEM pass phrase: "{{ client_passwd }}"
+          (?i)Verifying - Enter PEM pass phrase: "{{ client_passwd }}"
+      register: easy_rsa_build_client_result
+      changed_when: false
+      when: client_passwd != ''
+
+    - name: Easy-rsa build-client error?
+      when: easy_rsa_build_client_result.rc > 0
+      block:
+        - name: Print easy_rsa_build_client_result on error
+          ansible.builtin.debug:
+            msg: "{{ easy_rsa_build_client_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+    - name: Know TLS type from config
+      ansible.builtin.lineinfile:
+        path: '/etc/openvpn/server.conf'
+        regexp: '^tls-crypt'
+        state: absent
+      check_mode: true
+      changed_when: false
+      register: tls_crypt_result
+
+    - name: Set auth type tls-crypt
+      ansible.builtin.set_fact:
+        openvpn_tls: 'tls-crypt'
+      when: "tls_crypt_result.found"
+
+    - name: Set auth type tls-auth
+      ansible.builtin.set_fact:
+        openvpn_tls: 'tls-auth'
+      when: "not tls_crypt_result.found"
+
+    - name: Know user to copy ovpn file
+      ansible.builtin.set_fact:
+        home: "{{ lookup('env', 'USER') }}"
+    - name: Print home path to copy ovpn file
+      ansible.builtin.debug:
+        msg: "Ovpn file will be copied to {{ home }}"
+
+    - name: Read ca.crt
+      ansible.builtin.slurp:
+        src: '/etc/openvpn/easy-rsa/pki/ca.crt'
+      register: ca_crt_result
+    - name: Ca.crt to var
+      ansible.builtin.set_fact:
+        ca: "{{ ca_crt_result.content | b64decode | trim }}"
+    - name: Print ca.crt
+      ansible.builtin.debug:
+        msg: "Ca.crt content: {{ ca }}"
+
+    - name: Read client.crt
+      ansible.builtin.slurp:
+        src: '/etc/openvpn/easy-rsa/pki/issued/{{ clent_name }}.crt'
+      register: client_crt_result
+    - name: Client.crt to var
+      ansible.builtin.set_fact:
+        client: '{{ client_crt_result.content | b64decode | trim | regex_replace("[\s\S.]*(-----BEGIN CERTIFICATE-----[\s\S.]*-----END CERTIFICATE-----)[\s\S.]*", "\1") }}'
+    - name: Print client.crt
+      ansible.builtin.debug:
+        msg: "Client.crt content: {{ client }}"
+
+    - name: Read client.key
+      ansible.builtin.slurp:
+        src: '/etc/openvpn/easy-rsa/pki/private/{{ clent_name }}.key'
+      register: client_key_result
+    - name: Client.key to var
+      ansible.builtin.set_fact:
+        key: '{{ client_key_result.content | b64decode | trim }}'
+    - name: Print client.key
+      ansible.builtin.debug:
+        msg: "Client.crt content: {{ key }}"
+
+    - name: TLS-crypt file to var
+      when: "openvpn_tls == 'tls-crypt'"
+      block:
+        - name: Read TLS-crypt
+          ansible.builtin.slurp:
+            src: '/etc/openvpn/tls-crypt.key'
+          register: tls_crypt_result
+        - name: TLS-crypt to var
+          ansible.builtin.set_fact:
+            tls: '{{ tls_crypt_result.content | b64decode | trim }}'
+
+    - name: TLS-auth file to var
+      when: "openvpn_tls == 'tls-auth'"
+      block:
+        - name: Read TLS-auth
+          ansible.builtin.slurp:
+            src: '/etc/openvpn/tls-auth.key'
+          register: tls_auth_result
+        - name: TLS-crypt to var
+          ansible.builtin.set_fact:
+            tls: '{{ tls_auth_result.content | b64decode | trim }}'
+
+    - name: Copy ovpn file for user
+      ansible.builtin.copy:
+        src: '/etc/openvpn/client-template.txt'
+        dest: '/home/{{ ansible_ssh_user }}/{{ clent_name }}.ovpn'
+        remote_src: true
+        mode: '0644'
+        owner: root
+    - name: Content ovpn file
+      ansible.builtin.lineinfile:
+        path: '/home/{{ ansible_ssh_user }}/{{ clent_name }}.ovpn'
+        state: present
+        line: "{{ item }}"
+      with_items:
+        - '<ca>'
+        - '{{ ca }}'
+        - '</ca>'
+        - <cert>
+        - '{{ client }}'
+        - '</cert>'
+        - '<key>'
+        - '{{ key }}'
+        - '</key>'
+    - name: Tls-crypt config to ovpn file
+      ansible.builtin.lineinfile:
+        path: '/home/{{ ansible_ssh_user }}/{{ clent_name }}.ovpn'
+        state: present
+        line: "{{ item }}"
+      with_items:
+        - '<tls-crypt>'
+        - '{{ tls }}'
+        - '</tls-crypt>'
+      when: "openvpn_tls == 'tls-crypt'"
+    - name: Tls-auth config to ovpn file
+      ansible.builtin.lineinfile:
+        path: '/home/{{ ansible_ssh_user }}/{{ clent_name }}.ovpn'
+        state: present
+        line: "{{ item }}"
+      with_items:
+        - 'key-direction 1'
+        - '<tls-auth>'
+        - '{{ tls }}'
+        - '</tls-auth>'
+      when: "openvpn_tls == 'tls-auth'"
+...

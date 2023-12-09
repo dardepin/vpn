@@ -1,0 +1,15 @@
+---
+# playbook for installing OpenVPN in Debian distros
+# todo: personal roles for every distro
+# run: ansible-playbook vpn.yml
+
+- hosts: vpn
+  name: OpenVPN install for Linux distros
+  become: true
+  gather_facts: true
+
+  roles:
+    - { role: vpn_debian, when: ansible_distribution == 'Debian' }
+    - { role: vpn_ubuntu, when: ansible_distribution == 'Ubuntu' }
+    - { role: vpn_centos, when: ansible_distribution == 'CentOS' }
+...

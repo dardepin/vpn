@@ -1,0 +1,24 @@
+---
+# vars file for vpn_debian
+openvpn_group: nobody # 'nobody', 'nogroup'
+openvpn_ipv6: false # true, no
+openvpn_dns: unbound # 'current', 'unbound', 'quad9', 'quad9_uncensored', 'FDN', 'DNS.Watch', 'OpenDNS', 'google', 'adguard', 'nextdns', 'custom'
+openvpn_dns_servers: []
+openvpn_port: 1194
+openvpn_prot: udp # 'udp', 'tcp'
+openvpn_compression: false # true, false
+openvpn_compression_alg: lz4-v2 # 'lz4-v2', 'lz4', 'lzo'
+openvpn_cypher: AES-128-GCM # AES-128-GCM, AES-192-GCM, AES-256-GCM, AES-128-CBC, AES-192-CBC, AES-256-CBC
+openvpn_cert: ECDSA # 'ECDSA', 'RSA'
+openvpn_cert_ecdsa_curve: prime256v1 # 'prime256v1', 'prime384r1', 'prime521r1'
+openvpn_cert_rsa_key_size: 2048 # 2048, 3072, 4096
+openvpn_cc: TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256
+# 'TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256', 'TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384', 'TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256', 'TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384'
+openvpn_dh: ECDH # 'ECDH', 'DH'
+openvpn_ecdh_curve: prime256v1 # 'prime256v1', 'prime384r1', 'prime521r1'
+openvp_dh_size: 2048 # 2048, 3072, 4096
+openvpn_hmac: SHA256 # 'SHA-256', 'SHA-384', 'SHA-512'
+openvpn_tls: tls-crypt # 'tls-crypt', 'tls-auth'
+
+easyrsa_url: https://github.com/OpenVPN/easy-rsa/releases/download/v3.1.7/EasyRSA-3.1.7.tgz
+...

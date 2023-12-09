@@ -1,0 +1,5 @@
+bak/
+cp/
+tmp/
+*.json
+.vscode

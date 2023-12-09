@@ -1,0 +1,666 @@
+---
+# tasks file for vpn_ubuntu
+# tested on Ubuntu 18, 20, 22
+
+- name: Get service facts
+  ansible.builtin.service_facts:
+- name: Openvpn already installed
+  when: "'openvpn@server.service' in services"
+  block:
+    - name: Print existing server error
+      ansible.builtin.debug:
+        msg: 'Seems OpenVPN service already exists, may be you need to remove it first?'
+    - name: End play
+      ansible.builtin.meta: end_host
+
+- name: Get groups
+  ansible.builtin.shell: 'getent group | cut -d: -f1'
+  changed_when: false
+  register: result_groups
+  ignore_errors: true
+- name: Add nobody's name
+  ansible.builtin.set_fact:
+    openvpn_group: 'nogroup'
+  when: "'nogroup' in result_groups.stdout_lines"
+- name: Print nobody's name
+  ansible.builtin.debug:
+    msg: "Current nogroup's name: {{ openvpn_group }}"
+
+- name: Too old Ubuntu?
+  when: ansible_facts['distribution_major_version'] | int < 18
+  block:
+    - name: Print version warning
+      ansible.builtin.debug:
+        msg: '{{ ansible_distribution }} {{ ansible_distribution_major_version }} not supported, stopping'
+    - name: End play
+      ansible.builtin.meta: end_host
+
+- name: Ethernet not found?
+  when: not ansible_default_ipv4.interface
+  block:
+    - name: Print interface warning
+      ansible.builtin.debug:
+        msg: "no default network interface was found, stopping"
+    - name: End play
+      ansible.builtin.meta: end_host
+- name: Print default ethernet interface
+  ansible.builtin.debug:
+    msg: "Default eth interface is {{ ansible_default_ipv4.interface }}"
+
+- name: Get my public IP
+  community.general.ipify_facts:
+  timeout: 20
+- name: IpV4 not found?
+  when: not ipify_public_ip
+  block:
+    - name: Print ip warning
+      ansible.builtin.debug:
+        msg: "no public ip addres was found, stopping"
+    - name: End play
+      ansible.builtin.meta: end_host
+- name: Print pubilc ip
+  ansible.builtin.debug:
+    msg: "Your public ip is {{ ipify_public_ip }}"
+
+# generate server cn and server name
+- name: Generate server cn
+  ansible.builtin.set_fact:
+    server_cn: "cn_{{ lookup('community.general.random_string', length=16, special=false) }}"
+- name: Print server cn
+  ansible.builtin.debug:
+    msg: "Your generated server cn is {{ server_cn }}"
+- name: Generate server name
+  ansible.builtin.set_fact:
+    server_name: "server_{{ lookup('community.general.random_string', length=16, special=false) }}"
+- name: Print server name
+  ansible.builtin.debug:
+    msg: "Your generated server name is {{ server_name }}"
+
+- name: Install reqiured packets
+  ansible.builtin.apt:
+    name:
+      - python-apt-common
+      - ca-certificates
+      - curl
+      - iptables
+      - openssl
+      - python3-pexpect
+    state: present
+    update_cache: true
+- name: Package facts gathering
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Config for OpenVPN exists?
+  ansible.builtin.stat:
+    path: '/etc/openvpn/server.conf'
+  register: openvpn_result
+
+- name: Install OpenVPN
+  ansible.builtin.apt:
+    name: openvpn
+    state: latest
+    update_cache: true
+  when: "'openvpn' not in ansible_facts.packages or not openvpn_result.stat.exists"
+
+# create dirs for OpenVPN
+- name: Create client-config-dir
+  ansible.builtin.file:
+    path: '/etc/openvpn/ccd'
+    state: directory
+    mode: '0755'
+- name: Create log dir
+  ansible.builtin.file:
+    path: '/var/log/openvpn'
+    state: directory
+    mode: '0755'
+- name: Create iptables dir
+  ansible.builtin.file:
+    path: '/etc/iptables'
+    state: directory
+    mode: '0755'
+
+# easy-rsa installed?
+- name: Easy-rsa exists?
+  ansible.builtin.stat:
+    path: '/etc/openvpn/easy-rsa/'
+  register: easy_rsa_result
+
+# easy-rsa not installed
+- name: Download and setup easy-rsa
+  when: not openvpn_result.stat.exists
+  block:
+    - name: Create dir for easy-rsa
+      ansible.builtin.file:
+        path: '/etc/openvpn/easy-rsa/'
+        state: directory
+        mode: '0755'
+    - name: Download and unarchive easy-rsa
+      ansible.builtin.unarchive:
+        src: "{{ easyrsa_url }}"
+        dest: '/etc/openvpn/easy-rsa/'
+        remote_src: true
+        extra_opts: [--strip-components=1] # skip root folder in archive
+
+    - name: Configure easy-rsa for ECDSA
+      ansible.builtin.copy:
+        dest: '/etc/openvpn/easy-rsa/vars'
+        content: |
+                set_var EASYRSA_ALGO ec
+                set_var EASYRSA_CURVE {{ openvpn_cert_ecdsa_curve }}
+        mode: '0600'
+      when: "openvpn_cert == 'ECDSA'"
+    - name: Configure easy-rsa for RSA
+      ansible.builtin.copy:
+        dest: '/etc/openvpn/easy-rsa/vars'
+        content: |
+          set_var EASYRSA_KEY_SIZE {{ openvpn_cert_rsa_key_size }}
+        mode: '0600'
+      when: "openvpn_cert == 'RSA'"
+
+    - name: Write server cn
+      ansible.builtin.copy:
+        dest: '/etc/openvpn/easy-rsa/SERVER_CN_GENERATED'
+        content: |
+          {{ server_cn }}
+        owner: root
+        mode: '0644'
+    - name: Write server name
+      ansible.builtin.copy:
+        dest: '/etc/openvpn/easy-rsa/SERVER_NAME_GENERATED'
+        content: |
+          {{ server_name }}
+        owner: root
+        mode: '0644'
+
+    - name: Easy-rsa init-pki
+      ansible.builtin.command:
+        cmd: '/etc/openvpn/easy-rsa/easyrsa init-pki'
+      args:
+        chdir: '/etc/openvpn/easy-rsa/'
+      register: easy_rsa_init_pki_result
+      changed_when: false
+    - name: Easy-rsa init-pki error?
+      when: easy_rsa_init_pki_result.rc > 0
+      block:
+        - name: Print easy_rsa_init_pki_result on error
+          ansible.builtin.debug:
+            msg: "{{ easy_rsa_init_pki_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+    - name: Easy-rsa req-cn
+      ansible.builtin.command:
+        cmd: '/etc/openvpn/easy-rsa/easyrsa --batch --req-cn={{ server_cn }} build-ca nopass'
+      args:
+        chdir: '/etc/openvpn/easy-rsa/'
+      register: easy_rsa_req_cn_result
+      changed_when: false
+    - name: Easy-rsa req-cn error?
+      when: easy_rsa_req_cn_result.rc > 0
+      block:
+        - name: Print easy_rsa_req_cn_result on error
+          ansible.builtin.debug:
+            msg: "{{ easy_rsa_req_cn_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+    - name: Genearate dh.pem when RSA
+      when: "openvpn_cert == 'RSA'"
+      block:
+        - name: Create dh by Openssl
+          ansible.builtin.command:
+            cmd: 'openssl dhparam -out /etc/openvpn/easy-rsa/dh.pem {{ openvp_dh_size }}'
+          register: openssl_dhparam_result
+          changed_when: false
+        - name: Openssl dhparam error?
+          when: openssl_dhparam_result.rc > 0
+          block:
+            - name: Print openssl_dhparam_result on error
+              ansible.builtin.debug:
+                msg: "{{ openssl_dhparam_result }}"
+            - name: End play
+              ansible.builtin.meta: end_host
+
+    - name: Easy-rsa build
+      ansible.builtin.command: "/etc/openvpn/easy-rsa/easyrsa --batch build-server-full {{ server_name }} nopass"
+      args:
+        chdir: '/etc/openvpn/easy-rsa/'
+      register: easy_rsa_build_result
+      changed_when: false
+    - name: Easy-rsa build error?
+      when: easy_rsa_build_result.rc > 0
+      block:
+        - name: Print easy_rsa_build_result on error
+          ansible.builtin.debug:
+            msg: "{{ easy_rsa_build_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+    - name: Easy-rsa gen-crl
+      ansible.builtin.command:
+        cmd: "/etc/openvpn/easy-rsa/easyrsa gen-crl"
+      args:
+        chdir: '/etc/openvpn/easy-rsa/'
+      environment:
+        EASYRSA_CRL_DAYS: '3650'
+      register: easy_rsa_gen_crl_result
+      changed_when: false
+    - name: Easy-rsa gen-crl error?
+      when: easy_rsa_gen_crl_result.rc > 0
+      block:
+        - name: Print easy_rsa_gen_crl_result on error
+          ansible.builtin.debug:
+            msg: "{{ easy_rsa_gen_crl_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+    - name: Genearate tls-crypt key
+      ansible.builtin.command: "openvpn --genkey --secret /etc/openvpn/{{ openvpn_tls }}.key"
+      register: openvpn_genkey_result
+      changed_when: false
+    - name: OpenVPN genkey error?
+      when: openvpn_genkey_result.rc > 0
+      block:
+        - name: Print openvpn_genkey_result on error
+          ansible.builtin.debug:
+            msg: "{{ openvpn_genkey_result }}"
+        - name: End play
+          ansible.builtin.meta: end_host
+
+- name: Read sever name from file
+  ansible.builtin.slurp:
+    src: '/etc/openvpn/easy-rsa/SERVER_NAME_GENERATED'
+  register: server_name_generated
+- name: Set server name
+  ansible.builtin.set_fact:
+    server_name: "{{ server_name_generated.content | b64decode | trim }}"
+
+- name: Copy certificates to OpenVPN directory
+  ansible.builtin.copy:
+    src: '{{ item }}'
+    dest: '/etc/openvpn/'
+    owner: root
+    mode: '0600'
+    remote_src: true
+  with_items:
+    - '/etc/openvpn/easy-rsa/pki/ca.crt'
+    - '/etc/openvpn/easy-rsa/pki/crl.pem'
+    - '/etc/openvpn/easy-rsa/pki/private/ca.key'
+    - '/etc/openvpn/easy-rsa/pki/issued/{{ server_name }}.crt'
+    - '/etc/openvpn/easy-rsa/pki/private/{{ server_name }}.key'
+- name: Make crl.pem available
+  ansible.builtin.file:
+    path: '/etc/openvpn/crl.pem'
+    mode: '0644'
+- name: Copy dh.pem when RSA
+  ansible.builtin.copy:
+    src: '/etc/openvpn/easy-rsa/dh.pem'
+    dest: '/etc/openvpn/'
+    owner: root
+    mode: '0600'
+  when: "openvpn_cert == 'RSA'"
+
+- name: Configure OpenVPN
+  ansible.builtin.blockinfile:
+    path: '/etc/openvpn/server.conf'
+    block: |
+      port {{ openvpn_port }}
+      proto {{ openvpn_prot }}
+      dev tun
+      user nobody
+      group {{ openvpn_group }}
+      persist-key
+      persist-tun
+      keepalive 10 120
+      topology subnet
+      server 10.8.0.0 255.255.255.0
+      ifconfig-pool-persist ipp.txt
+    create: true
+    owner: root
+    mode: '0644'
+- name: Configure OpenVPN protocol for ipv6
+  ansible.builtin.replace:
+    path: '/etc/openvpn/server.conf'
+    regexp: '^proto {{ openvpn_prot }}'
+    replace: 'proto {{ openvpn_prot }}6'
+  when: openvpn_ipv6 | bool
+
+# Configure DNS
+- name: Set DNS option to current
+  when: "openvpn_dns|lower == 'current'"
+  block:
+    - name: Using systemd-resolved?
+      ansible.builtin.lineinfile:
+        path: '/etc/resolv.conf'
+        regexp: '^nameserver 127\.0\.0\.53'
+        state: absent
+      check_mode: true
+      register: systemd_resolved_result
+
+    - name: Systemd resolver used
+      ansible.builtin.shell: cat /run/systemd/resolve/resolv.conf | grep -v '^#'| grep nameserver | awk '{print $2}'
+      register: nameservers
+      changed_when: false
+      when: systemd_resolved_result.found
+
+    - name: Resolv conf used
+      ansible.builtin.shell: cat /etc/resolv.conf | grep -v '^#'| grep nameserver | awk '{print $2}'
+      changed_when: false
+      register: nameservers
+      when: not systemd_resolved_result.found
+
+    - name: Print found DNS servers
+      ansible.builtin.debug:
+        msg: "Found DNS servers: {{ nameservers.stdout_lines | list }}"
+    - name: Set to DNs servers to current
+      ansible.builtin.set_fact:
+        openvpn_dns_servers: "{{ nameservers | list }}"
+
+- name: Self-hosted DNS resolver
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['10.8.0.1']
+  when: "openvpn_dns|lower == 'unbound'"
+- name: Cloudflare DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['1.0.0.1', '1.1.1.1']
+  when: "openvpn_dns|lower == 'cloudflare'"
+- name: Quad9 DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['9.9.9.9', '149.112.112.112']
+  when: "openvpn_dns|lower == 'quad9'"
+- name: Quad9 uncensored DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['9.9.9.10', 149.112.112.10']
+  when: "openvpn_dns|lower == 'quad9_uncensored'"
+- name: FDN DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['80.67.169.40','80.67.169.12']
+  when: "openvpn_dns|lower == 'fdn'"
+- name: DNS.Watch DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['84.200.69.80', '84.200.70.40']
+  when: "openvpn_dns|lower == 'dns.watch'"
+- name: OpenDNS DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['208.67.222.222','208.67.220.220']
+  when: "openvpn_dns|lower == 'opendns'"
+- name: Yandex basics DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['77.88.8.8', '77.88.8.1']
+  when: "openvpn_dns|lower == 'yandex'"
+- name: Google DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['8.8.8.8', 8.8.4.4']
+  when: "openvpn_dns|lower == 'google'"
+- name: Adgurad DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['94.140.14.14', '94.140.15.15']
+  when: "openvpn_dns|lower == 'adguard'"
+- name: NextDNS DNS server
+  ansible.builtin.set_fact:
+    openvpn_dns_servers: ['45.90.28.167', '45.90.30.167']
+  when: "openvpn_dns|lower == 'nexdns'"
+
+- name: Check for DNS ip's
+  when: "openvpn_dns_servers | length == 0"
+  block:
+    - name: Print empty DNS error
+      ansible.builtin.debug:
+        msg: "DNS servers are not provided or incorrect"
+    - name: End play
+      ansible.builtin.meta: end_host
+
+- name: Print DNS servers
+  ansible.builtin.debug:
+    msg: "{{ openvpn_dns_servers }}"
+- name: Write DNS servers
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'push "dhcp-option DNS {{ item }}"'
+    state: present
+  with_items:
+    - "{{ openvpn_dns_servers }}"
+- name: Write redirect-gateway option
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'push "redirect-gateway def1 bypass-dhcp"'
+    state: present
+
+- name: Print DNS servers
+  ansible.builtin.debug:
+    msg: "{{ openvpn_dns_servers }}"
+- name: Write DNS servers
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'push "dhcp-option DNS {{ item }}"'
+    state: present
+  with_items:
+    - "{{ openvpn_dns_servers }}"
+- name: Write redirect-gateway option
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'push "redirect-gateway def1 bypass-dhcp"'
+    state: present
+
+# farther OpenVPN confguration
+- name: Ipv6 config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    state: present
+    line: "{{ item }}"
+  with_items:
+    - 'server-ipv6 fd42:42:42:42::/112'
+    - 'tun-ipv6'
+    - 'push tun-ipv6'
+    - 'push "route-ipv6 2000::/3"'
+    - 'push "redirect-gateway ipv6"'
+  when: openvpn_ipv6 | bool
+- name: Compression config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'compress {{ openvpn_compression_alg }}'
+    state: present
+  when: openvpn_compression
+- name: ECDH config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    state: present
+    line: "{{ item }}"
+  with_items:
+    - 'dh none'
+    - 'ecdh-curve {{ openvpn_ecdh_curve }}'
+  when: "openvpn_dh == 'ECDH'"
+- name: DH config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'dh dh.pem'
+  when: "openvpn_dh == 'DH'"
+- name: TLS-CRYPT config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'tls-crypt tls-crypt.key'
+  when: "openvpn_tls == 'tls-crypt'"
+- name: TLS-AUTH config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    line: 'tls-auth tls-auth.key 0'
+  when: "openvpn_tls == 'tls-auth'"
+- name: More config for OpenVPN
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/server.conf'
+    state: present
+    line: "{{ item }}"
+  with_items:
+    - 'crl-verify crl.pem'
+    - 'ca ca.crt'
+    - 'cert {{ server_name }}.crt'
+    - 'key {{ server_name }}.key'
+    - 'auth {{ openvpn_hmac }}'
+    - 'cipher {{ openvpn_cypher }}'
+    - 'ncp-ciphers {{ openvpn_cypher }}'
+    - 'tls-server'
+    - 'tls-version-min 1.2'
+    - 'tls-cipher {{ openvpn_cc }}'
+    - 'client-config-dir /etc/openvpn/ccd'
+    - 'status /var/log/openvpn/status.log'
+    - 'verb 3'
+
+- name: Enable ipv4 routing
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: 1
+    sysctl_set: true
+    sysctl_file: '/etc/sysctl.d/99-openvpn.conf'
+    reload: true
+- name: Enable ipv6 routing
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: 1
+    sysctl_set: true
+    sysctl_file: '/etc/sysctl.d/99-openvpn.conf'
+    reload: true
+  when: openvpn_ipv6 | bool
+
+- name: Configure SELinux to allow to listen 1194 port
+  community.general.seport:
+    ports: "{{ openvpn_port }}"
+    proto: "{{ openvpn_prot | lower }}"
+    setype: openvpn_port_t
+    state: present
+  when: ansible_facts.selinux.status == 'enabled'
+- name: Copy systemd config
+  ansible.builtin.copy:
+    src: '/lib/systemd/system/openvpn@.service'
+    dest: '/etc/systemd/system/openvpn@.service'
+    remote_src: true
+    mode: '0644'
+    owner: root
+- name: Comment LimitNPROC in systemd config
+  ansible.builtin.replace:
+    path: '/etc/systemd/system/openvpn@.service'
+    regexp: '^LimitNPROC'
+    replace: '#LimitNPROC'
+  notify: Daemon reload
+- name: Change OpenVPN server dir in systemd config
+  ansible.builtin.replace:
+    path: '/etc/systemd/system/openvpn@.service'
+    regexp: '/etc/openvpn/server'
+    replace: '/etc/openvpn'
+  notify: Daemon reload
+- name: Restart OpnVPN service
+  ansible.builtin.service:
+    name: openvpn@server
+    enabled: true
+    state: restarted
+
+# move unbound setup here
+- name: Install & setup unbound
+  when: "openvpn_dns|lower == 'unbound'"
+  block:
+    - name: Install unbound if required
+      ansible.builtin.apt:
+        name: unbound
+        state: present
+      when: "'unbound' not in ansible_facts.packages"
+    - name: Configure main config
+      ansible.builtin.lineinfile:
+        path: '/etc/unbound/unbound.conf'
+        line: 'include: /etc/unbound/openvpn.conf'
+        state: present
+    - name: Copy unbound config for openvpn
+      ansible.builtin.template:
+        src: 'openvpn.conf.j2'
+        dest: '/etc/unbound/openvpn.conf'
+        owner: root
+        mode: '0644'
+    - name: Change DNS in systemd-resolve
+      ansible.builtin.replace:
+        path: '/etc/systemd/resolved.conf'
+        regexp: '^(#?DNS=)'
+        replace: 'DNS=10.8.0.1'
+    - name: Change DNSStubListener in systemd-resolve
+      ansible.builtin.replace:
+        path: '/etc/systemd/resolved.conf'
+        regexp: '^#DNSStubListener='
+        replace: 'DNSStubListener=no'
+    - name: Create symlink for systemd-resolve
+      ansible.builtin.file:
+        src: '/run/systemd/resolve/resolv.conf'
+        dest: '/etc/resolv.conf'
+        state: link
+        force: true
+    - name: Restart systemd-resolved
+      ansible.builtin.service:
+        name: systemd-resolved
+        state: restarted
+    - name: Enable & start unbound
+      ansible.builtin.service:
+        name: unbound
+        enabled: true
+        state: restarted
+
+- name: Copy iptables & systemd scripts
+  block:
+    - name: Copy start script
+      ansible.builtin.template:
+        src: 'add-openvpn-rules.sh.j2'
+        dest: '/etc/iptables/add-openvpn-rules.sh'
+        owner: root
+        mode: '0755'
+    - name: Add IPV6 if required
+      ansible.builtin.lineinfile:
+        path: 'etc/iptables/add-openvpn-rules.sh'
+        state: present
+        line: "{{ item }}"
+      with_items:
+        - 'ip6tables -t nat -D POSTROUTING -s fd42:42:42:42::/112 -o {{ ansible_default_ipv4.interface }} -j MASQUERADE'
+        - 'ip6tables -D INPUT -i tun0 -j ACCEPT'
+        - 'ip6tables -D FORWARD -i {{ ansible_default_ipv4.interface }} -o tun0 -j ACCEPT'
+        - 'ip6tables -D FORWARD -i tun0 -o {{ ansible_default_ipv4.interface }} -j ACCEPT'
+        - 'ip6tables -D INPUT -i {{ ansible_default_ipv4.interface }} -p {{ openvpn_prot }} --dport {{ openvpn_port }} -j ACCEPT'
+      when: openvpn_ipv6 | bool
+    - name: Copy stop script
+      ansible.builtin.template:
+        src: 'del-openvpn-rules.sh.j2'
+        dest: '/etc/iptables/del-openvpn-rules.sh'
+        owner: root
+        mode: '0755'
+    - name: Add IPV6 if required
+      ansible.builtin.lineinfile:
+        path: '/etc/iptables/del-openvpn-rules.sh'
+        state: present
+        line: "{{ item }}"
+      with_items:
+        - 'ip6tables -t nat -D POSTROUTING -s fd42:42:42:42::/112 -o {{ ansible_default_ipv4.interface }} -j MASQUERADE'
+        - 'ip6tables -D INPUT -i tun0 -j ACCEPT'
+        - 'ip6tables -D FORWARD -i {{ ansible_default_ipv4.interface }} -o tun0 -j ACCEPT'
+        - 'ip6tables -D FORWARD -i tun0 -o {{ ansible_default_ipv4.interface }} -j ACCEPT'
+        - 'ip6tables -D INPUT -i {{ ansible_default_ipv4.interface }} -p { openvpn_prot }} --dport {{ openvpn_port }} -j ACCEPT'
+      when: openvpn_ipv6 | bool
+    - name: Copy systemd script
+      ansible.builtin.copy:
+        src: 'iptables-openvpn.service'
+        dest: '/etc/systemd/system/iptables-openvpn.service'
+        owner: root
+        mode: '644'
+      notify: Daemon reload
+    - name: Enable iptables daemon for OpenVPN
+      ansible.builtin.service:
+        name: iptables-openvpn
+        enabled: true
+        state: restarted
+
+- name: Copy client config
+  ansible.builtin.template:
+    src: 'client-template.txt.j2'
+    dest: '/etc/openvpn/client-template.txt'
+    owner: root
+    mode: '0644'
+- name: Enable compression in a client config
+  ansible.builtin.lineinfile:
+    path: '/etc/openvpn/client-template.txt'
+    line: 'compress {{ openvpn_compression_alg }}'
+    state: present
+  when: "openvpn_compression | bool"
+...
